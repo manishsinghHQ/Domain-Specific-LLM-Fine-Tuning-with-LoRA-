@@ -17,3 +17,4 @@ scipy
 scikit-learn
 numpy
 tqdm
+matplotlib
