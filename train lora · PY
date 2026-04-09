@@ -1,0 +1,220 @@
+"""
+train_lora.py — QLoRA Fine-Tuning Script for Medical QA
+Run: python scripts/train_lora.py --config configs/medlora.yaml
+"""
+
+import argparse
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+from datasets import load_dataset, DatasetDict
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainingArguments,
+)
+from trl import SFTTrainer
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+@dataclass
+class FineTuneConfig:
+    # Model
+    base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
+    output_dir: str = "./models/medlora"
+
+    # LoRA
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"])
+
+    # Training
+    num_epochs: int = 3
+    batch_size: int = 4
+    grad_accum: int = 8
+    learning_rate: float = 2e-4
+    max_seq_length: int = 1024
+    warmup_ratio: float = 0.03
+
+    # Data
+    dataset_path: str = "./data/medqa_instructions.json"
+    train_split: float = 0.8
+    val_split: float = 0.1
+
+    # Hardware
+    use_4bit: bool = True
+    fp16: bool = True
+    gradient_checkpointing: bool = True
+
+
+# ── Prompt formatting ──────────────────────────────────────────────────────────
+SYSTEM_PROMPT = (
+    "You are a knowledgeable medical assistant. Provide accurate, evidence-based "
+    "answers to medical questions. Always recommend consulting a healthcare professional "
+    "for personal medical advice."
+)
+
+def format_prompt(sample: dict) -> str:
+    """Convert a QA pair to Alpaca-style instruction format."""
+    return (
+        f"<s>[INST] <<SYS>>\n{SYSTEM_PROMPT}\n<</SYS>>\n\n"
+        f"{sample['instruction']}\n\nQuestion: {sample['input']} [/INST]\n"
+        f"{sample['output']} </s>"
+    )
+
+
+# ── Data loading ───────────────────────────────────────────────────────────────
+def load_and_split_dataset(config: FineTuneConfig):
+    """Load dataset from JSON and create train/val/test splits."""
+    with open(config.dataset_path) as f:
+        data = json.load(f)
+
+    n = len(data)
+    n_train = int(n * config.train_split)
+    n_val   = int(n * config.val_split)
+
+    from datasets import Dataset
+    full_ds = Dataset.from_list(data)
+    full_ds = full_ds.map(lambda x: {"text": format_prompt(x)})
+
+    splits = full_ds.train_test_split(test_size=1 - config.train_split, seed=42)
+    val_test = splits["test"].train_test_split(
+        test_size=config.val_split / (1 - config.train_split), seed=42
+    )
+
+    return DatasetDict({
+        "train": splits["train"],
+        "validation": val_test["train"],
+        "test": val_test["test"],
+    })
+
+
+# ── Model loading ──────────────────────────────────────────────────────────────
+def load_base_model(config: FineTuneConfig):
+    """Load the base model with optional 4-bit quantization."""
+    bnb_config = None
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config.base_model,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.base_model,
+        trust_remote_code=True,
+        padding_side="right",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+
+# ── LoRA setup ─────────────────────────────────────────────────────────────────
+def apply_lora(model, config: FineTuneConfig):
+    """Apply LoRA adapters to the model."""
+    if config.use_4bit:
+        model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        target_modules=config.target_modules,
+        lora_dropout=config.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    return model
+
+
+# ── Training ───────────────────────────────────────────────────────────────────
+def train(config: FineTuneConfig):
+    print("=" * 60)
+    print("  MedLoRA Fine-Tuning")
+    print("=" * 60)
+
+    # Load data
+    print("\n[1/4] Loading dataset...")
+    dataset = load_and_split_dataset(config)
+    print(f"  Train: {len(dataset['train'])} | Val: {len(dataset['validation'])} | Test: {len(dataset['test'])}")
+
+    # Load model
+    print("\n[2/4] Loading base model...")
+    model, tokenizer = load_base_model(config)
+
+    # Apply LoRA
+    print("\n[3/4] Applying LoRA adapters...")
+    model = apply_lora(model, config)
+
+    # Train
+    print("\n[4/4] Training...")
+    training_args = TrainingArguments(
+        output_dir=config.output_dir,
+        num_train_epochs=config.num_epochs,
+        per_device_train_batch_size=config.batch_size,
+        per_device_eval_batch_size=config.batch_size,
+        gradient_accumulation_steps=config.grad_accum,
+        learning_rate=config.learning_rate,
+        lr_scheduler_type="cosine",
+        warmup_ratio=config.warmup_ratio,
+        optim="paged_adamw_32bit",
+        fp16=config.fp16,
+        gradient_checkpointing=config.gradient_checkpointing,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        logging_steps=25,
+        report_to="tensorboard",
+        run_name="medlora-run",
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"],
+        dataset_text_field="text",
+        max_seq_length=config.max_seq_length,
+        tokenizer=tokenizer,
+        args=training_args,
+    )
+
+    trainer.train()
+
+    # Save adapter weights
+    adapter_path = os.path.join(config.output_dir, "adapter")
+    model.save_pretrained(adapter_path)
+    tokenizer.save_pretrained(adapter_path)
+    print(f"\n✅ Adapter saved to: {adapter_path}")
+
+    # Merge and save full model
+    print("Merging LoRA weights into base model...")
+    merged_model = model.merge_and_unload()
+    merged_path = os.path.join(config.output_dir, "merged")
+    merged_model.save_pretrained(merged_path, safe_serialization=True)
+    tokenizer.save_pretrained(merged_path)
+    print(f"✅ Merged model saved to: {merged_path}")
+
+    return trainer, dataset["test"]
+
+
+if __name__ == "__main__":
+    config = FineTuneConfig()
+    train(config)
