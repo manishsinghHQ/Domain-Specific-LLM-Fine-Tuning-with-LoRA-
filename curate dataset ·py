@@ -1,1 +1,132 @@
+"""
+curate_dataset.py — Curate 1,000+ medical QA instruction samples
+Sources: MedQuAD (HuggingFace), HealthSearchQA, custom templates
+Output: data/medqa_instructions.json
+"""
 
+import json
+import random
+from datasets import load_dataset
+
+INSTRUCTION = "Answer the following medical question accurately and concisely, citing relevant clinical context where appropriate."
+
+MEDICAL_TEMPLATES = [
+    # Symptoms
+    {"input": "What are the symptoms of {condition}?",
+     "output": "Symptoms of {condition} typically include... (clinical answer)"},
+    # Treatment
+    {"input": "How is {condition} treated?",
+     "output": "Treatment for {condition} involves a stepwise approach..."},
+    # Mechanism
+    {"input": "What causes {condition}?",
+     "output": "The etiology of {condition} is multifactorial..."},
+    # Drug
+    {"input": "How does {drug} work?",
+     "output": "{drug} acts by..."},
+    # Diagnosis
+    {"input": "How is {condition} diagnosed?",
+     "output": "Diagnosis of {condition} relies on..."},
+]
+
+def load_medquad():
+    """Load MedQuAD dataset from HuggingFace."""
+    try:
+        ds = load_dataset("lavita/medical-qa-datasets", "medquad", split="train")
+        samples = []
+        for item in ds:
+            if item.get("answer") and len(item["answer"]) > 100:
+                samples.append({
+                    "instruction": INSTRUCTION,
+                    "input": item["question"],
+                    "output": item["answer"],
+                    "source": "medquad",
+                    "category": item.get("focus_area", "General Medicine"),
+                })
+        return samples
+    except Exception as e:
+        print(f"Warning: Could not load MedQuAD — {e}")
+        return []
+
+
+def load_health_search_qa():
+    """Load HealthSearchQA dataset."""
+    try:
+        ds = load_dataset("katielink/healthsearchqa", split="train")
+        samples = []
+        for item in ds:
+            if item.get("answer"):
+                samples.append({
+                    "instruction": INSTRUCTION,
+                    "input": item["question"],
+                    "output": item["answer"],
+                    "source": "healthsearchqa",
+                    "category": "General Medicine",
+                })
+        return samples
+    except Exception as e:
+        print(f"Warning: Could not load HealthSearchQA — {e}")
+        return []
+
+
+def load_medalpaca():
+    """Load MedAlpaca dataset."""
+    try:
+        ds = load_dataset("medalpaca/medical_meadow_medqa", split="train")
+        samples = []
+        for item in ds:
+            samples.append({
+                "instruction": item.get("instruction", INSTRUCTION),
+                "input": item.get("input", ""),
+                "output": item.get("output", ""),
+                "source": "medalpaca",
+                "category": "Medical QA",
+            })
+        return samples
+    except Exception as e:
+        print(f"Warning: Could not load MedAlpaca — {e}")
+        return []
+
+
+def deduplicate(samples, key="input"):
+    """Remove duplicate questions."""
+    seen = set()
+    unique = []
+    for s in samples:
+        k = s[key].strip().lower()[:100]
+        if k not in seen and len(s["output"]) > 80:
+            seen.add(k)
+            unique.append(s)
+    return unique
+
+
+def curate(target=12845, output_path="./data/medqa_instructions.json"):
+    """Main curation pipeline."""
+    print("Curating medical QA dataset...")
+    all_samples = []
+
+    # Load from multiple sources
+    all_samples += load_medquad()
+    all_samples += load_health_search_qa()
+    all_samples += load_medalpaca()
+
+    # Deduplicate
+    all_samples = deduplicate(all_samples)
+    print(f"After dedup: {len(all_samples)} samples")
+
+    # Shuffle and truncate
+    random.seed(42)
+    random.shuffle(all_samples)
+    all_samples = all_samples[:target]
+
+    # Save
+    import os
+    os.makedirs("./data", exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(all_samples, f, indent=2)
+
+    print(f"✅ Saved {len(all_samples)} samples to {output_path}")
+    return all_samples
+
+
+if __name__ == "__main__":
+    curate()
